@@ -24,6 +24,8 @@ private const val IMAGE_SIZE = 28
 private const val NUM_LABELS = MnistDataset.NUM_CLASSES
 private const val SEED = 123456789L
 
+// SAME: -> 0埋めして画面の端までやる
+// VALID: -> 画面の端はやらない
 private const val PADDING_TYPE = "SAME"
 
 private const val INPUT_NAME = "input"
@@ -62,14 +64,29 @@ fun build(optimizerName: String): Graph {
     val graph = Graph()
 
     val tf = Ops.create(graph)
+
+    // 画像の入力
     val input = tf
+        // feedで指定してやることでここに画像の値が入る
         .withName(INPUT_NAME)
         .placeholder(
             TUint8::class.java,
+            // [-1(要素数不明), 28, 28]の3次元データを用意
+            // 1: 何枚目の画像か, 2: 画像の縦, 3: 画像の横
             Placeholder
                 .shape(Shape.of(-1, IMAGE_SIZE.toLong(), IMAGE_SIZE.toLong()))
         )
-    val inputReshaped = tf.reshape(input, tf.array(-1, IMAGE_SIZE, IMAGE_SIZE, NUM_CHANNELS))
+    // チャンネルの次元を追加（どんな色が出されるかを表す。今回は白黒のみなので1となる）
+    val inputReshaped = tf.reshape(
+        input,
+        tf.array(
+            -1,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+            NUM_CHANNELS,
+        ),
+    )
+    // 画像の正解ラベルを取得(符号なし8ビット整数)
     val labels = tf.withName(TARGET).placeholder(TUint8::class.java)
     val centeringFactor = tf.constant(PIXEL_DEPTH / 2.0f)
     val scalingFactor = tf.constant(PIXEL_DEPTH.toFloat())
@@ -81,34 +98,66 @@ fun build(optimizerName: String): Graph {
         scalingFactor,
     )
 
+    /**
+     * 畳み込みの重み（というかカーネル）設定
+     * ランダムな重みに0.1をかけた値を用いる
+     * variableなので学習時に変わる
+     */
     val conv1Weights = tf.variable(
         tf.math.mul(
+            /**
+             * 切断正規分布に従って重みを初期化する(切断正規分布: 正規分布の端っこを切り落とした分布)
+             */
             tf.random.truncatedNormal(
+                // 次元の大きさ [高さ, 幅, 入力チャンネル数, 出力チャンネル数]
+                // つまり今回は32個のランダムなカーネルが生成される
                 tf.array(5, 5, NUM_CHANNELS, 32),
                 TFloat32::class.java,
+                // 乱数生成に用いられる。これにより再現性を出す
                 TruncatedNormal.seed(SEED),
             ),
             tf.constant(0.1f),
         )
     )
+
+    /**
+     * 二次元畳み込み
+     * 第一引数: 畳み込み対象
+     * 第二引数: 畳み込みの際に用いるカーネル
+     * 第三引数: 各次元ごとのずらす幅(stride) 今回は4次元なので4次元配列で渡す(画像数とチャンネル数は1で固定するとのこと)
+     * 第４引数: 畳み込みの際に利用するアルゴリズム
+     */
     val conv1 = tf.nn.conv2d(scaledInput, conv1Weights, listOf(1L, 1L, 1L, 1L), PADDING_TYPE)
+    // バイアス値
+    // 全て0の一次元配列(長さ32)とする
+    // variableなので学習時に変わる
     val conv1Biases = tf.variable(
         tf.fill(
             tf.array(32),
             tf.constant(0.0f),
         ),
     )
+    // バイアス値を足した後の32次元の出力に対してreluを適用
     val relu1 = tf.nn.relu(tf.nn.biasAdd(conv1, conv1Biases))
 
+    // プーリングを実行
+    // 最大値をとっていく
+    // 出力値自体は小さくなるが、出力された数は同じ32個である
     val pool1 = tf.nn.maxPool(
         relu1,
+        // 2 × 2 のマス目から取っていく
         tf.array(1, 2, 2, 1),
+        // 2 × 2個飛ばし
         tf.array(1, 2, 2, 1),
+        // 端っこまでやる
         PADDING_TYPE,
     )
 
+    // ２度目の畳み込み用のカーネル
     val conv2Weight = tf.variable(
         tf.math.mul(
+            // 先ほどの畳み込みの出力が32次元だったため、入力は32個
+            // 出力は64個となる
             tf.random.truncatedNormal(
                 tf.array(5, 5, 32, 64),
                 TFloat32::class.java,
@@ -117,15 +166,19 @@ fun build(optimizerName: String): Graph {
             tf.constant(0.1f),
         ),
     )
+    // ２度目の畳み込み
     val conv2 = tf.nn.conv2d(pool1, conv2Weight, listOf(1L, 1L, 1L, 1L), PADDING_TYPE)
+    // バイアス値（出力が64個あるから64個用意）
     val conv2Biases = tf.variable(
         tf.fill(
             tf.array(64),
             tf.constant(0.1f),
         ),
     )
+    // バイアスを適用後、reluを適用
     val relu2 = tf.nn.relu(tf.nn.biasAdd(conv2, conv2Biases))
 
+    // 最大値を取るプーリングを実行
     val pool2 = tf.nn.maxPool(
         relu2,
         tf.array(1, 2, 2, 1),
@@ -133,17 +186,28 @@ fun build(optimizerName: String): Graph {
         PADDING_TYPE,
     )
 
+    // 次元を書き換える
+    // [一次元目のサイズ, 二次元目のサイズ, -1]となることが想定される
+    // つまり最後の次元に全部詰め込む
     val flatten = tf.reshape(
         pool2,
         tf.concat(
-            listOf(tf.slice(tf.shape(pool2), tf.array(0), tf.array(1)), tf.array(-1)),
+            //
+            listOf(
+                // 0 ~ 1番目のサイズのみ取り出す
+                tf.slice(tf.shape(pool2), tf.array(0), tf.array(1)),
+                tf.array(-1),
+            ),
+            // 最初の次元で合体させる
             tf.constant(0),
         ),
     )
 
+    // カーネル生成
     val fc1Weights = tf.variable(
         tf.math.mul(
             tf.random.truncatedNormal(
+                // 2次元(画像のピクセル数 × 4)(512)
                 tf.array(IMAGE_SIZE * IMAGE_SIZE * 4, 512),
                 TFloat32::class.java,
                 TruncatedNormal.seed(SEED),
@@ -151,7 +215,9 @@ fun build(optimizerName: String): Graph {
             tf.constant(0.1f),
         )
     )
+    // バイアス
     val fc1Biases = tf.variable(tf.fill(tf.array(512), tf.constant(0.1f)))
+
     val relu3 = tf.nn.relu(tf.math.add(tf.linalg.matMul(flatten, fc1Weights), fc1Biases))
 
     val fc2Weights = tf.variable(

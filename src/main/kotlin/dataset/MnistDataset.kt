@@ -64,15 +64,26 @@ class MnistDataset private constructor(
             )
             archiveStream.readShort()
             archiveStream.readByte()
+            // 識別子の一部分
+            // 画像 -> 3, ラベル -> 1
             val numDims = archiveStream.readByte().toInt()
             val dimSizes = LongArray(numDims)
+
+            // 次元数を決める作業
+            // 画像: データ数 * 行数 * 列数
+            // ラベル: ラベルデータの数
             var size = 1
             for (i in dimSizes.indices) {
                 dimSizes[i] = archiveStream.readInt().toLong()
                 size *= dimSizes[i].toInt()
             }
+
+            // 次元数の要素文のデータを取るため、そのサイズのバイト配列を用意
             val bytes = ByteArray(size)
             archiveStream.readFully(bytes)
+            // 次元(Shape)はdimSizesで取得した次元を利用
+            // DataBuffersは取得したバイト列
+            // これをByteNdArraysに変換して返す
             return NdArrays.wrap(Shape.of(*dimSizes), DataBuffers.of(bytes, true, false))
         }
     }
